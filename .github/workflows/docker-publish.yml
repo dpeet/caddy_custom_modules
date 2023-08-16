@@ -112,7 +112,7 @@ jobs:
           context: .
           push: true
           platforms: linux/arm/v7
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ steps.meta.outputs.tags }},pi3
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
