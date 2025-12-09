@@ -134,8 +134,11 @@ jobs:
 
       - name: Sign the published Docker image
         run: |
-          # Get the digest of the multi-arch manifest we just created
-          DIGEST=$(docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }} --format '{{.Manifest.Digest}}')
+          # Get the digest of the multi-arch manifest using crane
+          DIGEST=$(docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }} --raw | jq -r '.digest // empty')
+          # Fallback: extract from inspect output if raw doesn't have digest field
+          if [ -z "$DIGEST" ]; then
+            DIGEST=$(docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }} 2>&1 | grep -m1 "Digest:" | awk '{print $2}')
+          fi
           echo "Signing manifest digest: ${DIGEST}"
-          # Sign the manifest once (all tags point to same digest)
           cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}"
