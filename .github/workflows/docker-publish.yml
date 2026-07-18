@@ -8,10 +8,17 @@ name: Docker
 # "upgrades" with no changelog. Now each build computes a fingerprint from what
 # was ACTUALLY built -- the binary's own `caddy build-info` dependency list
 # (exact module versions xcaddy resolved), the caddy version, both base image
-# digests, and the repo commit -- and the merge job skips publishing when it
-# matches the fingerprint label already on ghcr :latest. Any real upstream
-# change (caddy release, module commit, rebased base image, repo edit) changes
-# the fingerprint and still publishes within a day, same as before.
+# digests, and the repo commit -- and compares it to the fingerprint label on
+# the ghcr :latest image. Unchanged fingerprint -> nothing is pushed at all
+# (not even per-arch digests, so no untagged cruft accumulates); changed ->
+# per-arch digests push and the merge job assembles + signs :latest. Any real
+# upstream change (caddy release, module commit, rebased base image, repo
+# edit) still publishes within a day, same as before.
+#
+# No gha layer cache on purpose: a poisoned cache blob (BlobNotFound on
+# import, deduped across scopes) fails buildx outright, and the cache only
+# accelerated across-run builds. Within a run the push build reuses the
+# builder's local store; the nightly cold compile is the cheap, reliable path.
 
 on:
   schedule:
@@ -74,8 +81,8 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
 
       # Build for THIS arch without pushing, so the fingerprint comes from the
-      # binary that will actually ship. The push build below reuses the cache,
-      # so this costs seconds, not a second compile.
+      # binary that will actually ship. The conditional push build below reuses
+      # the builder's local layer store, so it costs seconds, not a recompile.
       - name: Build locally for fingerprinting
         uses: docker/build-push-action@v6
         with:
@@ -99,12 +106,35 @@ jobs:
           echo "caddy=$version deps=$(echo "$deps" | wc -l) fp=$fingerprint"
           echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Compare against published fingerprint
+        id: gate
+        if: github.event_name != 'pull_request'
+        run: |
+          set -uo pipefail
+          # Fingerprint of what's currently on :latest. Any failure to read it
+          # (first run, label absent, registry hiccup) leaves it empty -> push.
+          current_fp=$(docker buildx imagetools inspect \
+            "${REGISTRY}/${IMAGE_NAME}:latest" --format '{{json .Image}}' 2>/dev/null \
+            | jq -r '(.["linux/amd64"] // .) | .config.Labels["net.dpeet.build.fingerprint"] // empty' \
+            || echo '')
+          force="${{ github.event_name == 'workflow_dispatch' && inputs.force }}"
+          if [ "${{ steps.fp.outputs.fingerprint }}" = "$current_fp" ] && [ "$force" != "true" ]; then
+            echo "::notice::${PLATFORM_PAIR}: fingerprint unchanged -- skipping digest push"
+            push_needed=false
+          else
+            echo "::notice::${PLATFORM_PAIR}: fingerprint ${current_fp:-<none>} -> ${{ steps.fp.outputs.fingerprint }} (caddy ${{ steps.fp.outputs.version }})"
+            push_needed=true
+          fi
+          echo "push_needed=$push_needed" >> "$GITHUB_OUTPUT"
           mkdir -p /tmp/meta
-          printf 'fingerprint=%s\nversion=%s\n' "$fingerprint" "$version" \
+          printf 'fingerprint=%s\nversion=%s\npush_needed=%s\n' \
+            "${{ steps.fp.outputs.fingerprint }}" "${{ steps.fp.outputs.version }}" "$push_needed" \
             > "/tmp/meta/${PLATFORM_PAIR}.env"
 
       - name: Build and push by digest
         id: build
+        if: github.event_name != 'pull_request' && steps.gate.outputs.push_needed == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -117,17 +147,17 @@ jobs:
             ${{ steps.meta.outputs.labels }}
             org.opencontainers.image.version=${{ steps.fp.outputs.version }}
             net.dpeet.build.fingerprint=${{ steps.fp.outputs.fingerprint }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.gate.outputs.push_needed == 'true'
         run: |
           mkdir -p /tmp/digests
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.gate.outputs.push_needed == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: digests-${{ env.PLATFORM_PAIR }}
@@ -154,13 +184,6 @@ jobs:
       id-token: write
 
     steps:
-      - name: Download digests
-        uses: actions/download-artifact@v4
-        with:
-          path: /tmp/digests
-          pattern: digests-*
-          merge-multiple: true
-
       - name: Download fingerprints
         uses: actions/download-artifact@v4
         with:
@@ -168,42 +191,51 @@ jobs:
           pattern: meta-*
           merge-multiple: true
 
+      - name: Reconcile per-arch decisions
+        id: gate
+        run: |
+          set -euo pipefail
+          amd_fp=$(grep '^fingerprint=' /tmp/meta/linux-amd64.env | cut -d= -f2)
+          arm_fp=$(grep '^fingerprint=' /tmp/meta/linux-arm64.env | cut -d= -f2)
+          amd_push=$(grep '^push_needed=' /tmp/meta/linux-amd64.env | cut -d= -f2)
+          arm_push=$(grep '^push_needed=' /tmp/meta/linux-arm64.env | cut -d= -f2)
+          version=$(grep '^version=' /tmp/meta/linux-amd64.env | cut -d= -f2)
+          if [ "$amd_fp" != "$arm_fp" ]; then
+            echo "::warning::amd64/arm64 fingerprints differ (upstream moved mid-build)"
+          fi
+          if [ "$amd_push" = "true" ] && [ "$arm_push" = "true" ]; then
+            echo "::notice::Publishing caddy $version"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          elif [ "$amd_push" = "false" ] && [ "$arm_push" = "false" ]; then
+            echo "::notice::Fingerprint unchanged on both arches -- nothing upstream changed, nothing pushed"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            # One arch pushed a digest, the other declined: a mid-build upstream
+            # change raced the two gates. Fail loudly; a `force` dispatch
+            # publishes a converged pair.
+            echo "::error::Per-arch gate decisions disagree (amd64=$amd_push arm64=$arm_push) -- re-run with force=true"
+            exit 1
+          fi
+
+      - name: Download digests
+        if: steps.gate.outputs.publish == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
       - name: Set up Docker Buildx
+        if: steps.gate.outputs.publish == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log into registry ${{ env.REGISTRY }}
+        if: steps.gate.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Decide whether to publish
-        id: gate
-        run: |
-          set -uo pipefail
-          . /tmp/meta/linux-amd64.env
-          new_fp="$fingerprint"
-          arm_fp=$(. /tmp/meta/linux-arm64.env; echo "$fingerprint")
-          if [ "$new_fp" != "$arm_fp" ]; then
-            # A module tagged/committed mid-build; arches resolved differently.
-            # Publish (safe direction) -- tomorrow's run converges.
-            echo "::warning::amd64/arm64 fingerprints differ; publishing anyway"
-          fi
-          # Fingerprint of what's currently on :latest. Any failure to read it
-          # (first run, label absent, registry hiccup) leaves it empty -> publish.
-          current_fp=$(docker buildx imagetools inspect \
-            "${REGISTRY}/${IMAGE_NAME}:latest" --format '{{json .Image}}' 2>/dev/null \
-            | jq -r '(.["linux/amd64"] // .) | .config.Labels["net.dpeet.build.fingerprint"] // empty' \
-            || echo '')
-          force="${{ github.event_name == 'workflow_dispatch' && inputs.force }}"
-          if [ "$new_fp" = "$current_fp" ] && [ "$force" != "true" ]; then
-            echo "::notice::Fingerprint unchanged ($new_fp) -- nothing upstream changed, skipping publish"
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::Publishing: fingerprint ${current_fp:-<none>} -> $new_fp (caddy $version)"
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Extract Docker metadata
         if: steps.gate.outputs.publish == 'true'
