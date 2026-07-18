@@ -8,7 +8,7 @@ name: Docker
 # "upgrades" with no changelog. Now each build computes a fingerprint from what
 # was ACTUALLY built -- the binary's own `caddy build-info` dependency list
 # (exact module versions xcaddy resolved), the caddy version, both base image
-# digests, and the repo commit -- and compares it to the fingerprint label on
+# digests, and the Dockerfile content -- and compares it to the label on
 # the ghcr :latest image. Unchanged fingerprint -> nothing is pushed at all
 # (not even per-arch digests, so no untagged cruft accumulates); changed ->
 # per-arch digests push and the merge job assembles + signs :latest. Any real
@@ -25,7 +25,6 @@ on:
     - cron: '0 7 * * *'
   push:
     branches: [ "main" ]
-    tags: [ 'v*.*.*' ]
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
@@ -34,6 +33,10 @@ on:
         description: 'Publish even if the fingerprint is unchanged'
         type: boolean
         default: false
+
+concurrency:
+  group: docker-publish
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
@@ -61,14 +64,14 @@ jobs:
           echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
 
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Log into registry ${{ env.REGISTRY }}
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -76,7 +79,7 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
 
@@ -84,7 +87,7 @@ jobs:
       # binary that will actually ship. The conditional push build below reuses
       # the builder's local layer store, so it costs seconds, not a recompile.
       - name: Build locally for fingerprinting
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -98,10 +101,19 @@ jobs:
           # `dep` lines carry exact module versions + hashes; arch-independent.
           deps=$(docker run --rm local/fingerprint:${PLATFORM_PAIR} caddy build-info | grep '^dep' | sort)
           version=$(docker run --rm local/fingerprint:${PLATFORM_PAIR} caddy version | awk '{print $1}')
+          # The binary is upstream-built code: refuse to propagate anything but
+          # a plain semver into outputs/labels/shell (script-injection guard).
+          if ! printf '%s' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::unexpected caddy version string: $(printf '%q' "$version")"
+            exit 1
+          fi
           base_runtime=$(docker buildx imagetools inspect caddy:2 --format '{{.Manifest.Digest}}')
           base_builder=$(docker buildx imagetools inspect caddy:builder --format '{{.Manifest.Digest}}')
+          # Dockerfile hash, NOT github.sha: workflow-only commits must not
+          # republish a byte-identical artifact (fleet redeploy noise).
+          dockerfile_hash=$(sha256sum Dockerfile | cut -d' ' -f1)
           fingerprint=$(printf '%s\n%s\n%s\n%s\n%s\n' \
-            "$deps" "$version" "$base_runtime" "$base_builder" "${{ github.sha }}" \
+            "$deps" "$version" "$base_runtime" "$base_builder" "$dockerfile_hash" \
             | sha256sum | cut -d' ' -f1)
           echo "caddy=$version deps=$(echo "$deps" | wc -l) fp=$fingerprint"
           echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
@@ -110,6 +122,10 @@ jobs:
       - name: Compare against published fingerprint
         id: gate
         if: github.event_name != 'pull_request'
+        env:
+          NEW_FP: ${{ steps.fp.outputs.fingerprint }}
+          NEW_VERSION: ${{ steps.fp.outputs.version }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
         run: |
           set -uo pipefail
           # Fingerprint of what's currently on :latest. Any failure to read it
@@ -118,24 +134,23 @@ jobs:
             "${REGISTRY}/${IMAGE_NAME}:latest" --format '{{json .Image}}' 2>/dev/null \
             | jq -r '(.["linux/amd64"] // .) | .config.Labels["net.dpeet.build.fingerprint"] // empty' \
             || echo '')
-          force="${{ github.event_name == 'workflow_dispatch' && inputs.force }}"
-          if [ "${{ steps.fp.outputs.fingerprint }}" = "$current_fp" ] && [ "$force" != "true" ]; then
+          if [ "$NEW_FP" = "$current_fp" ] && [ "$FORCE" != "true" ]; then
             echo "::notice::${PLATFORM_PAIR}: fingerprint unchanged -- skipping digest push"
             push_needed=false
           else
-            echo "::notice::${PLATFORM_PAIR}: fingerprint ${current_fp:-<none>} -> ${{ steps.fp.outputs.fingerprint }} (caddy ${{ steps.fp.outputs.version }})"
+            echo "::notice::${PLATFORM_PAIR}: fingerprint ${current_fp:-<none>} -> $NEW_FP (caddy $NEW_VERSION)"
             push_needed=true
           fi
           echo "push_needed=$push_needed" >> "$GITHUB_OUTPUT"
           mkdir -p /tmp/meta
           printf 'fingerprint=%s\nversion=%s\npush_needed=%s\n' \
-            "${{ steps.fp.outputs.fingerprint }}" "${{ steps.fp.outputs.version }}" "$push_needed" \
+            "$NEW_FP" "$NEW_VERSION" "$push_needed" \
             > "/tmp/meta/${PLATFORM_PAIR}.env"
 
       - name: Build and push by digest
         id: build
         if: github.event_name != 'pull_request' && steps.gate.outputs.push_needed == 'true'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -158,7 +173,7 @@ jobs:
 
       - name: Upload digest
         if: github.event_name != 'pull_request' && steps.gate.outputs.push_needed == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: digests-${{ env.PLATFORM_PAIR }}
           path: /tmp/digests/*
@@ -167,7 +182,7 @@ jobs:
 
       - name: Upload fingerprint
         if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: meta-${{ env.PLATFORM_PAIR }}
           path: /tmp/meta/*
@@ -185,7 +200,7 @@ jobs:
 
     steps:
       - name: Download fingerprints
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: /tmp/meta
           pattern: meta-*
@@ -201,7 +216,10 @@ jobs:
           arm_push=$(grep '^push_needed=' /tmp/meta/linux-arm64.env | cut -d= -f2)
           version=$(grep '^version=' /tmp/meta/linux-amd64.env | cut -d= -f2)
           if [ "$amd_fp" != "$arm_fp" ]; then
-            echo "::warning::amd64/arm64 fingerprints differ (upstream moved mid-build)"
+            # Publishing would assemble a mixed-version manifest. Next run (or a
+            # force dispatch) rebuilds both arches against converged upstream.
+            echo "::error::amd64/arm64 fingerprints differ (upstream moved mid-build) -- refusing to publish a mixed pair"
+            exit 1
           fi
           if [ "$amd_push" = "true" ] && [ "$arm_push" = "true" ]; then
             echo "::notice::Publishing caddy $version"
@@ -219,7 +237,7 @@ jobs:
 
       - name: Download digests
         if: steps.gate.outputs.publish == 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: /tmp/digests
           pattern: digests-*
@@ -227,11 +245,11 @@ jobs:
 
       - name: Set up Docker Buildx
         if: steps.gate.outputs.publish == 'true'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Log into registry ${{ env.REGISTRY }}
         if: steps.gate.outputs.publish == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -240,12 +258,11 @@ jobs:
       - name: Extract Docker metadata
         if: steps.gate.outputs.publish == 'true'
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
-            type=ref,event=tag
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
 
@@ -253,26 +270,29 @@ jobs:
         if: steps.gate.outputs.publish == 'true'
         working-directory: /tmp/digests
         run: |
+          [ "$(ls | wc -l)" -eq 2 ] || { echo "::error::expected exactly 2 arch digests, found $(ls | wc -l)"; exit 1; }
           docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
 
       - name: Inspect image
         if: steps.gate.outputs.publish == 'true'
+        env:
+          IMAGE_VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAME}:${IMAGE_VERSION}"
 
       - name: Install cosign
         if: steps.gate.outputs.publish == 'true'
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign the published Docker image
         if: steps.gate.outputs.publish == 'true'
+        env:
+          IMAGE_VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          # Get the digest of the multi-arch manifest using crane
-          DIGEST=$(docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }} --raw | jq -r '.digest // empty')
-          # Fallback: extract from inspect output if raw doesn't have digest field
-          if [ -z "$DIGEST" ]; then
-            DIGEST=$(docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }} 2>&1 | grep -m1 "Digest:" | awk '{print $2}')
-          fi
+          # Deterministic: the raw OCI index has no self-digest field; the
+          # imagetools --format template is the supported way to get it.
+          DIGEST=$(docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAME}:${IMAGE_VERSION}" --format '{{.Manifest.Digest}}')
+          echo "$DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$' || { echo "::error::bad digest: $DIGEST"; exit 1; }
           echo "Signing manifest digest: ${DIGEST}"
-          cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}"
+          cosign sign --yes "${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
