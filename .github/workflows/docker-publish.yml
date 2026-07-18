@@ -1,5 +1,18 @@
 name: Docker
 
+# Nightly rebuild that publishes ONLY when something real changed.
+#
+# The old behavior pushed a fresh :latest digest every night even when caddy,
+# every module, and both base images were unchanged -- so Watchtower redeployed
+# caddy on every host every day and the upgrade digest reported meaningless
+# "upgrades" with no changelog. Now each build computes a fingerprint from what
+# was ACTUALLY built -- the binary's own `caddy build-info` dependency list
+# (exact module versions xcaddy resolved), the caddy version, both base image
+# digests, and the repo commit -- and the merge job skips publishing when it
+# matches the fingerprint label already on ghcr :latest. Any real upstream
+# change (caddy release, module commit, rebased base image, repo edit) changes
+# the fingerprint and still publishes within a day, same as before.
+
 on:
   schedule:
     - cron: '0 7 * * *'
@@ -8,6 +21,12 @@ on:
     tags: [ 'v*.*.*' ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Publish even if the fingerprint is unchanged'
+        type: boolean
+        default: false
 
 env:
   REGISTRY: ghcr.io
@@ -54,16 +73,54 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
 
+      # Build for THIS arch without pushing, so the fingerprint comes from the
+      # binary that will actually ship. The push build below reuses the cache,
+      # so this costs seconds, not a second compile.
+      - name: Build locally for fingerprinting
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: local/fingerprint:${{ env.PLATFORM_PAIR }}
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
+
+      - name: Compute build fingerprint
+        id: fp
+        run: |
+          set -euo pipefail
+          # `dep` lines carry exact module versions + hashes; arch-independent.
+          deps=$(docker run --rm local/fingerprint:${PLATFORM_PAIR} caddy build-info | grep '^dep' | sort)
+          version=$(docker run --rm local/fingerprint:${PLATFORM_PAIR} caddy version | awk '{print $1}')
+          base_runtime=$(docker buildx imagetools inspect caddy:2 --format '{{.Manifest.Digest}}')
+          base_builder=$(docker buildx imagetools inspect caddy:builder --format '{{.Manifest.Digest}}')
+          fingerprint=$(printf '%s\n%s\n%s\n%s\n%s\n' \
+            "$deps" "$version" "$base_runtime" "$base_builder" "${{ github.sha }}" \
+            | sha256sum | cut -d' ' -f1)
+          echo "caddy=$version deps=$(echo "$deps" | wc -l) fp=$fingerprint"
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          mkdir -p /tmp/meta
+          printf 'fingerprint=%s\nversion=%s\n' "$fingerprint" "$version" \
+            > "/tmp/meta/${PLATFORM_PAIR}.env"
+
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: ${{ matrix.platform }}
-          labels: ${{ steps.meta.outputs.labels }}
+          # Custom labels come after the metadata-action set so they win on
+          # duplicate keys: version becomes the real caddy version (the
+          # watchtower digest reads it to bound release ranges), and the
+          # fingerprint rides the image so tomorrow's run can compare.
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.version=${{ steps.fp.outputs.version }}
+            net.dpeet.build.fingerprint=${{ steps.fp.outputs.fingerprint }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
           cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
-          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
 
       - name: Export digest
         if: github.event_name != 'pull_request'
@@ -78,6 +135,15 @@ jobs:
         with:
           name: digests-${{ env.PLATFORM_PAIR }}
           path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload fingerprint
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: meta-${{ env.PLATFORM_PAIR }}
+          path: /tmp/meta/*
           if-no-files-found: error
           retention-days: 1
 
@@ -98,10 +164,52 @@ jobs:
           pattern: digests-*
           merge-multiple: true
 
+      - name: Download fingerprints
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/meta
+          pattern: meta-*
+          merge-multiple: true
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Log into registry ${{ env.REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide whether to publish
+        id: gate
+        run: |
+          set -uo pipefail
+          . /tmp/meta/linux-amd64.env
+          new_fp="$fingerprint"
+          arm_fp=$(. /tmp/meta/linux-arm64.env; echo "$fingerprint")
+          if [ "$new_fp" != "$arm_fp" ]; then
+            # A module tagged/committed mid-build; arches resolved differently.
+            # Publish (safe direction) -- tomorrow's run converges.
+            echo "::warning::amd64/arm64 fingerprints differ; publishing anyway"
+          fi
+          # Fingerprint of what's currently on :latest. Any failure to read it
+          # (first run, label absent, registry hiccup) leaves it empty -> publish.
+          current_fp=$(docker buildx imagetools inspect \
+            "${REGISTRY}/${IMAGE_NAME}:latest" --format '{{json .Image}}' 2>/dev/null \
+            | jq -r '(.["linux/amd64"] // .) | .config.Labels["net.dpeet.build.fingerprint"] // empty' \
+            || echo '')
+          force="${{ github.event_name == 'workflow_dispatch' && inputs.force }}"
+          if [ "$new_fp" = "$current_fp" ] && [ "$force" != "true" ]; then
+            echo "::notice::Fingerprint unchanged ($new_fp) -- nothing upstream changed, skipping publish"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Publishing: fingerprint ${current_fp:-<none>} -> $new_fp (caddy $version)"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Extract Docker metadata
+        if: steps.gate.outputs.publish == 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -112,27 +220,24 @@ jobs:
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Log into registry ${{ env.REGISTRY }}
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Create manifest list and push
+        if: steps.gate.outputs.publish == 'true'
         working-directory: /tmp/digests
         run: |
           docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
 
       - name: Inspect image
+        if: steps.gate.outputs.publish == 'true'
         run: |
           docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
 
       - name: Install cosign
+        if: steps.gate.outputs.publish == 'true'
         uses: sigstore/cosign-installer@v3
 
       - name: Sign the published Docker image
+        if: steps.gate.outputs.publish == 'true'
         run: |
           # Get the digest of the multi-arch manifest using crane
           DIGEST=$(docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }} --raw | jq -r '.digest // empty')
