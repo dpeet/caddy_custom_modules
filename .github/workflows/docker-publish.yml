@@ -83,8 +83,6 @@ jobs:
           platforms: ${{ matrix.platform }}
           load: true
           tags: local/fingerprint:${{ env.PLATFORM_PAIR }}
-          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}-v2
-          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}-v2
 
       - name: Compute build fingerprint
         id: fp
@@ -120,7 +118,6 @@ jobs:
             org.opencontainers.image.version=${{ steps.fp.outputs.version }}
             net.dpeet.build.fingerprint=${{ steps.fp.outputs.fingerprint }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
-          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}-v2
 
       - name: Export digest
         if: github.event_name != 'pull_request'
