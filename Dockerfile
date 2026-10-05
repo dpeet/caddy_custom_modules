@@ -1,6 +1,7 @@
 FROM caddy:builder AS builder
 
-RUN xcaddy build \
+# Do not inherit the builder image's CADDY_VERSION: its tag can lag a Caddy release.
+RUN xcaddy build latest \
     --with github.com/caddy-dns/cloudflare \
     --with github.com/mholt/caddy-ratelimit \
     --with github.com/porech/caddy-maxmind-geolocation \
