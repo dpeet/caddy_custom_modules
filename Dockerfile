@@ -1,6 +1,9 @@
 FROM caddy:builder AS builder
 
-RUN xcaddy build \
+# Pin core to v2.11.7: 2.11.6 cuts long-lived streams at its 1m idle timeouts (caddy #8103/#8118)
+# and caddy:builder still ships 2.11.6. Drop the version argument once caddy:builder >= 2.11.7.
+# See peet_homeautomation docs/todo/caddy-2-11-6-edge-review.md (D1b).
+RUN xcaddy build v2.11.7 \
     --with github.com/caddy-dns/cloudflare \
     --with github.com/mholt/caddy-ratelimit \
     --with github.com/porech/caddy-maxmind-geolocation \
