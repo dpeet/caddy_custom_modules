@@ -95,6 +95,21 @@ jobs:
           load: true
           tags: local/fingerprint:${{ env.PLATFORM_PAIR }}
 
+      # Every module the fleet's Caddyfiles rely on must be in the binary, because a build that
+      # silently drops one (e.g. an @main dependency breaking) would fail to load on every host.
+      # Hosts also validate their own config before swapping (peet_homeautomation
+      # caddy-image-update.sh); this catches the defect before anything is published.
+      - name: Check required modules
+        run: |
+          set -euo pipefail
+          have=$(docker run --rm "local/fingerprint:${PLATFORM_PAIR}" caddy list-modules)
+          missing=$(grep -vxFf <(echo "$have") required-modules.txt || true)
+          if [ -n "$missing" ]; then
+            echo "::error::required Caddy modules missing from the build: $(tr '\n' ' ' <<< "$missing")"
+            exit 1
+          fi
+          echo "all $(wc -l < required-modules.txt) required modules present"
+
       - name: Compute build fingerprint
         id: fp
         run: |
@@ -226,6 +241,7 @@ jobs:
           if [ "$amd_push" = "true" ] && [ "$arm_push" = "true" ]; then
             echo "::notice::Publishing caddy $version"
             echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "version=$version" >> "$GITHUB_OUTPUT"
           elif [ "$amd_push" = "false" ] && [ "$arm_push" = "false" ]; then
             echo "::notice::Fingerprint unchanged on both arches -- nothing upstream changed, nothing pushed"
             echo "publish=false" >> "$GITHUB_OUTPUT"
@@ -267,6 +283,10 @@ jobs:
             type=ref,event=branch
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
+            # Rollback handles: the Caddy version, and a dated variant so two publishes of
+            # the same version (dependency changes) stay distinguishable.
+            type=raw,value=${{ steps.gate.outputs.version }},enable={{is_default_branch}}
+            type=raw,value=${{ steps.gate.outputs.version }}-{{date 'YYYYMMDD'}},enable={{is_default_branch}}
 
       - name: Create manifest list and push
         if: steps.gate.outputs.publish == 'true'
