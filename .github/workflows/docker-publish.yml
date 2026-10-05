@@ -95,10 +95,10 @@ jobs:
           load: true
           tags: local/fingerprint:${{ env.PLATFORM_PAIR }}
 
-      # Every module the fleet's Caddyfiles rely on must be in the binary, because a build that
-      # silently drops one (e.g. an @main dependency breaking) would fail to load on every host.
-      # Hosts also validate their own config before swapping (peet_homeautomation
-      # caddy-image-update.sh); this catches the defect before anything is published.
+      # Every plugin module the build ships today must still be registered: a --with that fails to
+      # compile already fails xcaddy, so this catches a dependency renaming or dropping a module ID.
+      # The list is all 19 plugin modules, a superset of what the fleet's Caddyfiles use; hosts also
+      # validate their own config before swapping (peet_homeautomation caddy-image-update.sh).
       - name: Check required modules
         run: |
           set -euo pipefail
@@ -283,10 +283,10 @@ jobs:
             type=ref,event=branch
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
-            # Rollback handles: the Caddy version, and a dated variant so two publishes of
-            # the same version (dependency changes) stay distinguishable.
+            # Rollback handles: the Caddy version (moves with each publish), and a UTC-timestamped
+            # variant that stays put, so two publishes of one version on the same day both survive.
             type=raw,value=${{ steps.gate.outputs.version }},enable={{is_default_branch}}
-            type=raw,value=${{ steps.gate.outputs.version }}-{{date 'YYYYMMDD'}},enable={{is_default_branch}}
+            type=raw,value=${{ steps.gate.outputs.version }}-{{date 'YYYYMMDD-HHmm'}},enable={{is_default_branch}}
 
       - name: Create manifest list and push
         if: steps.gate.outputs.publish == 'true'
